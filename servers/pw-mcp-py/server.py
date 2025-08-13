@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 from playwright.sync_api import sync_playwright
-import subprocess, json, pathlib
+import subprocess, json, pathlib, shutil, os
 from git import Repo
 
 app = FastAPI()
@@ -36,16 +36,36 @@ def tool(call: ToolCall):
         tests_root = pathlib.Path(i["testsRoot"])
         tests_root.mkdir(parents=True, exist_ok=True)
         name = i.get("name") or "generated.spec.ts"
-        scenario = (i.get("scenario") or "Generated scenario").replace("'", "\'")
-        spec_path = tests_root / name
+        scenario = (i.get("scenario") or "Generated scenario").replace("'", "\\'")
+        steps = i.get("steps") or []  # NEW: structured steps from router
+
+        # Render simple steps to Playwright code (assumes targets are element IDs)
+        body_lines = []
+        for s in steps:
+            a = (s.get("action") or "").lower()
+            tgt = s.get("target")
+            val = s.get("value")
+            if a == "open" and val:
+                body_lines.append(f'await page.goto("{val}");')
+            elif a == "click" and tgt:
+                body_lines.append(f'await page.click("#{tgt}");')
+            elif a == "type" and tgt and val is not None:
+                body_lines.append(f'await page.fill("#{tgt}", "{val}");')
+            elif a == "asserttext" and tgt and val is not None:
+                body_lines.append(f'await expect(page.locator("#{tgt}")).toContainText("{val}");')
+            else:
+                body_lines.append(f'// TODO: unsupported step: {s}')
+
+        body = "\n  ".join(body_lines) or "// TODO: derive concrete steps from scenario"
         code = f"""import {{ test, expect }} from '@playwright/test';
 
-test('{scenario}', async ({{ page }}) => {{
-  // TODO: derive concrete steps from scenario
-  await expect(page).toBeTruthy();
-}});
-"""
+    test('{scenario}', async ({{ page }}) => {{
+      {body}
+    }});
+    """
+        spec_path = tests_root / name
         spec_path.write_text(code, encoding="utf-8")
+
         pkg = tests_root / "package.json"
         if not pkg.exists():
             pkg.write_text(json.dumps({
@@ -56,10 +76,31 @@ test('{scenario}', async ({{ page }}) => {{
             }, indent=2))
         return {"path": str(spec_path)}
 
+
     if t == "run_tests":
         tests_root = i["testsRoot"]
-        proc = subprocess.run(["npx", "playwright", "test"], cwd=tests_root, capture_output=True, text=True)
+    # Ensure Node Playwright exists in testsRoot (Windows-friendly)
+        import os, shutil
+        has_node_modules = os.path.exists(os.path.join(tests_root, "node_modules"))
+        # 1) npm init (if package.json missing)
+        pkg_json = os.path.join(tests_root, "package.json")
+        if not os.path.exists(pkg_json):
+            subprocess.run(["npm", "init", "-y"], cwd=tests_root, capture_output=True, text=True, shell=True)
+        # 2) install @playwright/test if missing
+        pw_cli = os.path.join(tests_root, "node_modules", ".bin", "playwright.cmd" if os.name == "nt" else "playwright")
+        if not os.path.exists(pw_cli):
+            subprocess.run(["npm", "i", "-D", "@playwright/test@^1.48.0"],
+                           cwd=tests_root, capture_output=True, text=True, shell=True)
+        # 3) install browsers (chromium is enough for most)
+        subprocess.run(["npx", "playwright", "install", "chromium"],
+                       cwd=tests_root, capture_output=True, text=True, shell=True)
+
+        # 4) run tests
+        proc = subprocess.run(["npx", "playwright", "test"],
+                              cwd=tests_root, capture_output=True, text=True, shell=True)
         return {"code": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}
+
+
 
     if t == "git_push":
         project_root = i["projectRoot"]
@@ -78,3 +119,4 @@ test('{scenario}', async ({{ page }}) => {{
         return {"ok": True}
 
     return {"error": f"unknown tool {t}"}
+

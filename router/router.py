@@ -1,28 +1,51 @@
 import argparse, os, requests, sys
-from scenario_parser import parse
+from scenario_parser import parse_ui, parse_api
 
 PW_URL = os.getenv("PW_URL", "http://localhost:7010")
 SEL_URL = os.getenv("SEL_URL", "http://localhost:7020")
 
+def _ensure_open_step(steps, app_url: str):
+    """Ensure there's an 'open' step with a valid URL. If an 'open' exists but is invalid, fix it."""
+    def valid_url(v: str) -> bool:
+        return isinstance(v, str) and (v.startswith("http://") or v.startswith("https://") or v.startswith("/"))
+    for s in steps:
+        if s.get("action") == "open":
+            if not valid_url(s.get("value")) and app_url:
+                s["value"] = app_url   # fix invalid open
+            return steps
+    # No open at all → inject at the beginning
+    if app_url:
+        steps.insert(0, {"action": "open", "value": app_url})
+    return steps
+
+
 def call(url, tool, payload=None):
     payload = payload or {}
-    r = requests.post(f"{url}/tool", json={"tool": tool, "input": payload}, timeout=180)
+    r = requests.post(f"{url}/tool", json={"tool": tool, "input": payload}, timeout=600)
     r.raise_for_status()
     return r.json()
 
-def run_playwright(app_url, scenario, tests_root, tests_repo):
+def run_playwright(app_url, scenario_text, tests_root, tests_repo):
+    steps = _ensure_open_step(parse_ui(scenario_text), app_url)
+    # Inject an 'open' step if missing, using the CLI --appUrl
+    if app_url and not any(s.get("action") == "open" for s in steps):
+        steps.insert(0, {"action": "open", "value": app_url})
     call(PW_URL, "launch_browser", {"headless": True})
     call(PW_URL, "goto", {"url": app_url})
     call(PW_URL, "generate_playwright_test", {
         "testsRoot": tests_root,
         "name": "generated.spec.ts",
-        "scenario": scenario
+        "scenario": scenario_text,
+        "steps": steps
     })
     print(call(PW_URL, "run_tests", {"testsRoot": tests_root}))
-    call(PW_URL, "git_push", {"projectRoot": tests_root, "remoteUrl": tests_repo, "branch": "main"})
+    #call(PW_URL, "git_push", {"projectRoot": tests_root, "remoteUrl": tests_repo, "branch": "main"})
 
 def run_selenium_ui(app_url, scenario_text, tests_root, tests_repo):
-    steps = parse(scenario_text)
+    steps = _ensure_open_step(parse_ui(scenario_text), app_url)
+    if app_url and not any(s.get("action") == "open" for s in steps):
+        steps.insert(0, {"action": "open", "value": app_url})
+    # Example POM with common fields; adjust to your app’s selectors
     pom_out = call(SEL_URL, "generate_pom_ui", {
         "packageName": "com.example.pages",
         "className": "GeneratedPage",
@@ -56,29 +79,8 @@ def run_selenium_ui(app_url, scenario_text, tests_root, tests_repo):
     call(SEL_URL, "git_push", {"projectRoot": tests_root, "remoteUrl": tests_repo, "branch": "main"})
 
 def run_selenium_api(base_url, scenario_text, tests_root, tests_repo):
-    requests_spec = []
-    for raw in scenario_text.splitlines():
-        line = raw.strip()
-        if not line: 
-            continue
-        parts = line.split()
-        method = parts[0].upper()
-        path = parts[1] if len(parts) > 1 else "/"
-        status = 200
-        if "expect" in line.lower():
-            try:
-                status = int(line.lower().split("expect")[-1].strip().split()[0])
-            except Exception:
-                status = 200
-        requests_spec.append({
-            "name": f"{method} {path}",
-            "method": method,
-            "path": path,
-            "headers": {},
-            "query": {},
-            "body": None,
-            "expect": {"status": status, "jsonPaths": {}}
-        })
+    # Parse NL → RestAssured request specs
+    requests_spec = parse_api(scenario_text)
 
     api_out = call(SEL_URL, "generate_testng_api_test", {
         "packageName": "com.example.api",
@@ -102,7 +104,7 @@ def run_selenium_api(base_url, scenario_text, tests_root, tests_repo):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--framework", required=True, choices=["playwright", "selenium-testng"])
-    ap.add_argument("--testType", default="ui", choices=["ui","api"])
+    ap.add_argument("--testType", default="ui", choices=["ui","api"])  # ui (Selenium) | api (RestAssured)
     ap.add_argument("--appUrl", required=True)
     ap.add_argument("--scenario", required=True)
     ap.add_argument("--testsRoot", default="./tests")
