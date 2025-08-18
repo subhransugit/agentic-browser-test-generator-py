@@ -285,4 +285,3 @@ def tool(call: ToolCall):
         return {"ok": True}
 
     return {"error": f"unknown tool {t}"}
-
